@@ -386,7 +386,19 @@ def ping_ip(ip: str, timeout_s: float):
     return result.returncode == 0
 
 
-def ensure_ip_available(ip: str, check: bool, timeout_s: float) -> None:
+def is_local_ip(ip: str) -> bool:
+    """True, если адрес уже назначен одному из локальных интерфейсов."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.bind((ip, 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def ensure_ip_available(ip: str, check: bool, timeout_s: float, strict: bool) -> None:
     try:
         ipaddress.ip_address(ip)
     except ValueError:
@@ -396,17 +408,32 @@ def ensure_ip_available(ip: str, check: bool, timeout_s: float) -> None:
         log("IP", f"Проверка занятости {ip} отключена (--no-check-ip).")
         return
 
+    if is_local_ip(ip):
+        log(
+            "IP",
+            f"{ip} уже назначен локальному интерфейсу — похоже на остаток прошлого "
+            "запуска. Продолжаю (адаптер переиспользуется).",
+        )
+        return
+
     log("IP", f"Проверяю, свободен ли {ip} (ping, таймаут {timeout_s:g} с)...")
     answer = ping_ip(ip, timeout_s)
-    if answer is True:
-        sys.exit(
-            f"IP {ip} уже используется: адрес отвечает на ping. "
-            "Выберите другой через --virtual-ip или пропустите проверку --no-check-ip."
-        )
+    if answer is None:
+        log("IP", "Утилита ping не найдена — проверку занятости пропускаю.")
+        return
     if answer is False:
         log("IP", f"{ip} не отвечает — адрес свободен.")
         return
-    log("IP", "Утилита ping не найдена — проверку занятости пропускаю.")
+
+    message = (
+        f"IP {ip} отвечает на ping: адрес может быть занят (например, роутером в вашей "
+        "сети). Выберите другой через --virtual-ip, отключите проверку --no-check-ip "
+        "или разрешите запуск --strict-ip."
+    )
+    if strict:
+        sys.exit(message)
+    log("IP", f"ВНИМАНИЕ: {message}")
+    log("IP", "Продолжаю запуск, потому что --strict-ip не указан.")
 
 
 def ensure_subnet_route(adapter: str, virtual_ip: str, netmask: str) -> None:
@@ -442,7 +469,25 @@ def create_tap(adapter: str, virtual_ip: str, netmask: str, mtu: int) -> TapDevi
         tap = TapDevice(name=adapter, mtu=mtu)
     except TapDeviceError as e:
         sys.exit(f"Не удалось создать TUN-адаптер: {e}")
-    tap.ifconfig(ip=virtual_ip, netmask=netmask, mtu=mtu)
+    except OSError as e:
+        winerror = getattr(e, "winerror", None)
+        if winerror == 5 or e.errno in (1, 13, 19):
+            sys.exit(
+                "Не удалось создать TUN-адаптер: нет прав администратора. "
+                "Запустите скрипт ещё раз и подтвердите запрос UAC (Windows) "
+                "или sudo (Linux)."
+            )
+        sys.exit(f"Не удалось создать TUN-адаптер: {type(e).__name__}: {e}")
+
+    try:
+        tap.ifconfig(ip=virtual_ip, netmask=netmask, mtu=mtu)
+    except (TapDeviceError, OSError) as e:
+        try:
+            tap.close()
+        except Exception:
+            pass
+        sys.exit(f"Не удалось настроить TUN-адаптер {tap.name}: {e}")
+
     log("TUN", f"Интерфейс {tap.name}: {virtual_ip}/{netmask}, MTU {mtu}")
     ensure_subnet_route(tap.name, virtual_ip, netmask)
     return tap
@@ -467,7 +512,9 @@ def read_client_token(args: argparse.Namespace) -> str:
 
 
 def run_server(args: argparse.Namespace) -> None:
-    ensure_ip_available(args.virtual_ip, args.check_ip, args.ping_timeout)
+    ensure_ip_available(
+        args.virtual_ip, args.check_ip, args.ping_timeout, args.strict_ip
+    )
 
     with create_tap(args.adapter, args.virtual_ip, args.netmask, args.mtu) as tap:
         listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -476,7 +523,16 @@ def run_server(args: argparse.Namespace) -> None:
             listen_sock.bind(("127.0.0.1", args.serve_port))
             listen_sock.listen(5)
         except OSError as e:
-            sys.exit(f"Не удалось занять порт {args.serve_port}: {e}")
+            hint = (
+                f'netstat -ano | findstr :{args.serve_port}'
+                if IS_WINDOWS
+                else f"ss -tlnp | grep :{args.serve_port}"
+            )
+            sys.exit(
+                f"Не удалось занять порт {args.serve_port}: {e}\n"
+                f"Возможно, остался запущенный tailcat от прошлого раза. Проверьте: {hint}\n"
+                f"Либо укажите другой порт: --serve-port {args.serve_port + 1}"
+            )
         log("Сервер", f"Слушаю 127.0.0.1:{args.serve_port} для подключений от tailcat")
 
         log("Сервер", f"Запуск Tailcat serve на порту {args.serve_port}...")
@@ -546,7 +602,9 @@ def run_client(args: argparse.Namespace) -> None:
     if not token:
         sys.exit("Токен не задан.")
 
-    ensure_ip_available(args.virtual_ip, args.check_ip, args.ping_timeout)
+    ensure_ip_available(
+        args.virtual_ip, args.check_ip, args.ping_timeout, args.strict_ip
+    )
 
     with create_tap(args.adapter, args.virtual_ip, args.netmask, args.mtu) as tap:
         log("Туннель", f"Подключение к серверу (порт {args.serve_port})...")
@@ -637,6 +695,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default=1.0,
         help="Таймаут ping при проверке IP, секунды (по умолчанию 1.0)",
     )
+    ip_group.add_argument(
+        "--strict-ip",
+        action="store_true",
+        help="Прерывать запуск, если IP отвечает на ping (по умолчанию только предупреждение)",
+    )
 
     chat_group = parser.add_argument_group("доставка сообщений")
     chat_group.add_argument(
@@ -705,13 +768,36 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = build_parser().parse_args()
-    validate_args(args)
-    check_platform_support()
-    require_admin()
-    if args.mode == "server":
-        run_server(args)
-    else:
-        run_client(args)
+    failed = True
+    try:
+        validate_args(args)
+        check_platform_support()
+        require_admin()
+        if args.mode == "server":
+            run_server(args)
+        else:
+            run_client(args)
+        failed = False
+    except KeyboardInterrupt:
+        stop_event.set()
+        print("\nОстановлено пользователем.", flush=True)
+        failed = False
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        # Окно, открытое через UAC/sudo, не должно закрываться мгновенно:
+        # иначе сообщение об ошибке никто не увидит.
+        if failed and "--elevated-attempt" in sys.argv:
+            if sys.stdin is not None and sys.stdin.isatty():
+                try:
+                    input("Нажмите Enter, чтобы закрыть окно...")
+                except (EOFError, KeyboardInterrupt):
+                    pass
 
 
 if __name__ == "__main__":
