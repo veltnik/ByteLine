@@ -1,0 +1,2 @@
+pytap3>=3.1.2
+tailkitty>=0.3.0
