@@ -74,6 +74,7 @@ from typing import BinaryIO, Callable, Iterator
 
 from pytap3 import TapDevice, TapDeviceError
 from tailkitty import BackendNotFound, Client, ServerProcess, ServerStartError
+from tailkitty import run as tailkitty_run
 
 __version__ = "0.2.0"
 
@@ -89,6 +90,7 @@ DEFAULT_CHAT_PORT = 59999
 DEFAULT_SERVER_IP = "10.0.0.1"
 DEFAULT_CLIENT_IP = "10.0.0.2"
 DEFAULT_TOKEN_FILE = "token.txt"
+DEFAULT_KEY_NAME = "byteline"
 
 
 # ---------------------------------------------------------------------------
@@ -207,11 +209,22 @@ class TunnelConfig:
 
 @dataclass
 class ServerConfig(TunnelConfig):
-    """Настройки сервера (сторона с публичным адресом Tailcat)."""
+    """Настройки сервера (сторона с публичным адресом Tailcat).
+
+    ``key`` — имя сохранённого ключа Tailcat. С постоянным ключом и
+    зафиксированным DERP-регионом токен не меняется между запусками.
+    ``ephemeral_key=True`` возвращает старое поведение (новый токен каждый
+    запуск). ``rotate_key=True`` перегенерирует ключ и выдаёт новый токен.
+    """
 
     adapter: str = "pytap3-server"
     virtual_ip: str = DEFAULT_SERVER_IP
     peer_ip: str = DEFAULT_CLIENT_IP
+    key: str = DEFAULT_KEY_NAME
+    ephemeral_key: bool = False
+    rotate_key: bool = False
+    region: str = ""
+    full_address: bool = True
 
 
 @dataclass
@@ -997,6 +1010,58 @@ def _accept_loop(listen_sock: socket.socket, tap: TapDevice, mtu: int) -> None:
         threading.Thread(target=tap_to_pipe, args=(tap, writer, mtu), daemon=True).start()
 
 
+def list_keys() -> list[str]:
+    """Возвращает имена сохранённых ключей Tailcat."""
+    try:
+        result = tailkitty_run(
+            ["genkey", "--list"], capture_output=True, text=True, check=False
+        )
+    except Exception:  # noqa: BLE001 - список нужен только для подсказки
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def key_exists(name: str) -> bool:
+    """True, если сохранённый ключ Tailcat с таким именем существует."""
+    return name in list_keys()
+
+
+def ensure_key(name: str, rotate: bool = False, region: str = "") -> bool:
+    """Создаёт сохранённый ключ Tailcat, если его нет (или если rotate).
+
+    Возвращает True, если ключ был создан/перегенерирован.
+
+    Raises:
+        TunnelError: если Tailcat не смог создать ключ.
+    """
+    if not rotate and key_exists(name):
+        return False
+
+    args = ["genkey", f"--key={name}"]
+    if region:
+        args.append(f"--region={region}")
+    else:
+        # Запекаем DERP-регион в ключ, иначе токен меняется при смене
+        # выбранного по латентности релея.
+        args.append("--fixed-region")
+    if rotate:
+        args.append("--force")
+
+    action = "Перегенерирую" if rotate else "Создаю"
+    log("Ключ", f"{action} постоянный ключ Tailcat «{name}»...")
+    try:
+        result = tailkitty_run(args, capture_output=True, text=True, check=False)
+    except Exception as exc:  # noqa: BLE001
+        raise TunnelError(
+            f"Не удалось создать ключ Tailcat: {type(exc).__name__}: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        detail = ((result.stderr or "") + (result.stdout or "")).strip()
+        raise TunnelError(f"Не удалось создать ключ Tailcat «{name}»: {detail}")
+    log("Ключ", f"Ключ «{name}» готов — токен будет постоянным.")
+    return True
+
+
 def run_server(config: TunnelConfig) -> None:
     """Поднимает сервер: TUN, tailcat serve и чат.
 
@@ -1007,6 +1072,18 @@ def run_server(config: TunnelConfig) -> None:
     """
     config.validate()
     stop_event.clear()
+
+    # Постоянный токен: сохранённый ключ + зафиксированный DERP-регион.
+    key = "new" if getattr(config, "ephemeral_key", False) else getattr(
+        config, "key", DEFAULT_KEY_NAME
+    )
+    if key != "new":
+        ensure_key(
+            key,
+            rotate=getattr(config, "rotate_key", False),
+            region=getattr(config, "region", ""),
+        )
+
     ensure_ip_available(
         config.virtual_ip, config.check_ip, config.ping_timeout, config.strict_ip
     )
@@ -1025,8 +1102,8 @@ def run_server(config: TunnelConfig) -> None:
             log("Сервер", f"Запуск Tailcat serve на порту {config.serve_port}...")
             server = ServerProcess(
                 serve=[config.serve_port],
-                key="new",
-                full_address=True,
+                key=key,
+                full_address=getattr(config, "full_address", True),
                 stderr=subprocess.PIPE,
             )
             try:
@@ -1045,6 +1122,10 @@ def run_server(config: TunnelConfig) -> None:
                 ) from exc
 
             log("Сервер", f"Токен (сохранён в {token_path}):\n    {token}")
+            if key != "new":
+                log("Сервер", "Токен постоянный — ключ сохранён, токен не изменится при перезапуске")
+            else:
+                log("Сервер", "Токен одноразовый — при перезапуске сервера он изменится")
             log("Сервер", "Ожидание подключения клиента...")
 
             threading.Thread(
@@ -1230,6 +1311,40 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_key_args(parser: argparse.ArgumentParser) -> None:
+    """Флаги постоянного токена (только для сервера)."""
+    key_group = parser.add_argument_group("постоянный токен")
+    key_group.add_argument(
+        "--key",
+        default=DEFAULT_KEY_NAME,
+        help=f"Имя сохранённого ключа Tailcat (по умолчанию {DEFAULT_KEY_NAME}). "
+        "С ним токен не меняется между запусками",
+    )
+    key_group.add_argument(
+        "--rotate-key",
+        action="store_true",
+        help="Перегенерировать ключ и выдать новый токен (старый перестанет работать)",
+    )
+    key_group.add_argument(
+        "--ephemeral-key",
+        action="store_true",
+        help="Новый одноразовый токен при каждом запуске (старое поведение)",
+    )
+    key_group.add_argument(
+        "--region",
+        default="",
+        help="DERP-регион для ключа, например 303 или frankfurt "
+        "(по умолчанию выбирается один раз по задержке и закрепляется)",
+    )
+    key_group.add_argument(
+        "--short-address",
+        dest="full_address",
+        action="store_false",
+        default=True,
+        help="Короткий токен без встроенных DERP-деталей (154 вместо 232 символов)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="byteline",
@@ -1243,6 +1358,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     server_parser = subparsers.add_parser("server", help="Запустить сервер")
     add_common_args(server_parser)
+    add_key_args(server_parser)
     server_parser.set_defaults(
         adapter="pytap3-server", virtual_ip=DEFAULT_SERVER_IP, peer_ip=DEFAULT_CLIENT_IP
     )
@@ -1281,7 +1397,14 @@ def config_from_args(args: argparse.Namespace) -> TunnelConfig:
         console=True,
     )
     if args.mode == "server":
-        return ServerConfig(**common)
+        return ServerConfig(
+            key=args.key,
+            rotate_key=args.rotate_key,
+            ephemeral_key=args.ephemeral_key,
+            region=args.region,
+            full_address=args.full_address,
+            **common,
+        )
     return ClientConfig(token=(args.token or args.server or ""), **common)
 
 

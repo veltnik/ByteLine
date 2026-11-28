@@ -19,28 +19,29 @@ TUN-туннель через Tailcat и надёжный чат по UDP с п�
 ## Установка
 
 ```bash
-pip install .
+pip install byteline
 ```
 
-Или без установки, прямо из файла:
-
-```bash
-python byteline.py --help
-```
-
-Зависимости: `pytap3` (TUN-адаптер) и `tailkitty` (Tailcat).
+Зависимости (`pytap3` — TUN-адаптер, `tailkitty` — Tailcat) подтягиваются автоматически.
 
 После установки появляются:
 
 - команда `byteline` в консоли;
 - модуль `byteline` для `import byteline`.
 
+Можно и без установки, прямо из файла:
+
+```bash
+pip install -r requirements.txt
+python byteline.py --help
+```
+
 ### Linux
 
 ```bash
 sudo apt install -y python3 python3-venv net-tools iproute2
 python3 -m venv .venv
-.venv/bin/pip install .
+.venv/bin/pip install byteline
 .venv/bin/byteline server
 ```
 
@@ -55,6 +56,25 @@ byteline server
 ```
 
 Печатает токен `tc...` и сохраняет его в `token.txt`.
+
+#### Постоянный токен
+
+По умолчанию токен **связан с сохранённым ключом** Tailcat и не меняется
+при перезапуске сервера. Чтобы перегенерировать токен:
+
+```bash
+byteline server --rotate-key
+```
+
+Одноразовый токен (старое поведение):
+
+```bash
+byteline server --ephemeral-key
+```
+
+Дополнительно:
+- `--region 303` — закрепить конкретный DERP-регион при создании ключа;
+- `--short-address` — короткий токен (154 символа вместо 232).
 
 ### Клиент
 
@@ -85,6 +105,11 @@ byteline client --server <token>
 | `--ack-timeout` | 1.5 | 1.5 | ожидание ACK, сек |
 | `--ack-retries` | 5 | 5 | всего попыток отправки |
 | `--max-message` | 900 | 900 | лимит сообщения, байт |
+| `--key` | byteline | — | имя сохранённого ключа (постоянный токен) |
+| `--rotate-key` | выкл | — | перегенерировать ключ и токен |
+| `--ephemeral-key` | выкл | — | одноразовый токен при каждом запуске |
+| `--region` | — | — | DERP-регион для ключа |
+| `--short-address` | выкл | — | короткий токен без DERP-деталей |
 
 Примеры:
 
@@ -200,6 +225,14 @@ setup.py           установка пакета (модуль + команд�
 requirements.txt   зависимости
 README.md          этот файл
 LICENSE            MIT
+```
+
+Установка из исходников:
+
+```bash
+git clone https://github.com/veltnik/ByteLine.git
+cd ByteLine
+pip install .
 ```
 
 ## Лицензия
