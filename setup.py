@@ -6,7 +6,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="byteline",
-    version="0.2.0",
+    version="0.3.1",
     author="Veltnik",
     author_email="Redm1nx@yandex.ru",
     description="TUN-туннель через Tailcat и надёжный чат с подтверждением доставки",

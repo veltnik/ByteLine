@@ -76,7 +76,7 @@ from pytap3 import TapDevice, TapDeviceError
 from tailkitty import BackendNotFound, Client, ServerProcess, ServerStartError
 from tailkitty import run as tailkitty_run
 
-__version__ = "0.2.0"
+__version__ = "0.3.1"
 
 IS_WINDOWS = os.name == "nt"
 IFNAMSIZ = 16  # Linux: имя интерфейса вместе с завершающим NUL
@@ -179,8 +179,8 @@ class TunnelConfig:
 
     # Доставка сообщений
     reliable: bool = True
-    ack_timeout: float = 1.5
-    ack_retries: int = 5
+    ack_timeout: float = 2.5
+    ack_retries: int = 8
     max_message: int = 900
 
     # Читать сообщения из stdin и отправлять их собеседнику
